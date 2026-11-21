@@ -31,13 +31,16 @@ sys.path.insert(0, ROOT)
 import mechfight as mf  # noqa: E402
 from world import World  # noqa: E402
 from nav import NavGrid, Follower  # noqa: E402
+sys.path.insert(0, HERE)
+import precompute_conceal as PC  # noqa: E402
 
 TAU = 2 * math.pi
 DT = 0.05
 LEVELS = ["easy"] * 4 + ["medium"] * 4 + ["hard"] * 4 + ["expert"] * 3
 
-# Squad model, calibrated 2026-11-20 so starter / v0 / v1 land near their real practice scores
-# (real 1.15 / 3.94 / 3.79; sim 0.8 / 4.2 / 4.4 over 40 matches each).
+# Squad model, calibrated 2026-11-20 against real practice scores. Weak scripted easy bots plus medium-and-up
+# hunters that run our v2 combat logic with aim noise reproduce the "wall" all versions hit:
+# real starter / v0 / v1 / v2 = 1.15 / 3.94 / 3.79 / 4.04; sim 0.65 / 4.12 / 3.40 / 4.94 (48 matches each).
 PARAMS = {
     "skill": {  # aim noise (rad), reaction lag (s), strafe amount, laser release tolerance (rad)
         "easy": {"noise": 0.014, "lag": 0.40, "strafe": 0.25, "ltol": 0.014, "react": 0.8},
@@ -51,9 +54,12 @@ PARAMS = {
     "engage_range": 0.0,   # a non-hunter that sees us closer than this fights
     "retaliate_s": 0.0,      # a non-hunter we shot fights back for this long (0 = never)
     "skill_scale": 3.0,      # multiplies aim noise, laser tolerance and reaction lag of every house bot
-    "omniscient": True,      # hunters always know where we are
+    "omniscient": True,      # hunters always know where we are (False: shared vision + hearing, then search)
     "loadout": {"laser": 0.5, "lightning": 0.25, "mortar": 0.25},
     "fight_range": {"laser": 130.0, "gun": 90.0, "lightning": 28.0, "mortar": 120.0},
+    "strong_levels": ["medium", "hard", "expert"],  # hunters that run a real bot's combat logic (StrongBrain)
+    "strong_bot": "v2",      # which bot version they run
+    "strong_noise": {"easy": 0.02, "medium": 0.006, "hard": 0.003, "expert": 0.0015},  # aim noise added (rad)
 }
 
 
@@ -76,7 +82,7 @@ def load_bot_module(spec):
         path = os.path.join(d, "bot.py")
         open(path, "w").write(src)
     else:
-        rev = {"v0": "333fb36", "v1c": "9f4e5fc"}.get(spec, spec)
+        rev = {"v0": "333fb36", "v1c": "9f4e5fc", "v2": "92a99a7"}.get(spec, spec)
         src = subprocess.run(["git", "-C", ROOT, "show", f"{rev}:bot.py"], capture_output=True, text=True, check=True).stdout
         d = tempfile.mkdtemp(prefix=f"bot_{spec}_")
         path = os.path.join(d, "bot.py")
@@ -283,7 +289,7 @@ class Arena:
                 spawns.append(p)
             elif p and len(spawns) < 16 and self.rng.random() < 0.002:
                 sep *= 0.95
-        levels = list(LEVELS)
+        levels = list(LEVELS) + ["expert"]  # 16th label only used in free-for-all mode
         for i in range(16):
             p = spawns[i]
             pos = (p[0], p[1], self.w.ground_at(*p))
@@ -363,6 +369,11 @@ class Arena:
         if d > near and abs(wrap(math.atan2(dy, dx) - a.aim[0])) > math.radians(v["fov_deg"] / 2):
             return False
         e = (a.pos[0], a.pos[1], a.pos[2] + a.st["eye_height"] * a.size)
+        cg = _W.get("canopy")
+        if cg is not None:
+            far = d > near  # proximity sensors ignore canopy
+            return (PC.sees(self.w, cg[0], cg[1], e[0], e[1], e[2], pos[0], pos[1], pos[2] + top_h * 0.5, far)
+                    or PC.sees(self.w, cg[0], cg[1], e[0], e[1], e[2], pos[0], pos[1], pos[2] + top_h * 0.95, far))
         return self.los(e, (pos[0], pos[1], pos[2] + top_h * 0.5)) or self.los(e, (pos[0], pos[1], pos[2] + top_h * 0.95))
 
     # ---------------------------------------------------------------- damage
@@ -429,6 +440,14 @@ class Arena:
 
     def sound(self, kind, pos, src):
         rng = self.cfg["sound"]["range"].get(kind, 100)
+        sq = getattr(self, "squad", None)
+        if sq is not None and src is not None and not src.house:
+            for m in sq.members:
+                if m.alive and hyp(pos[0] - m.pos[0], pos[1] - m.pos[1]) < rng:
+                    err = 10.0 if kind in ("step", "boost", "reload") else 20.0
+                    sq.known = [pos[0] + self.rng.gauss(0, err), pos[1] + self.rng.gauss(0, err), pos[2]]
+                    sq.known_t = self.t
+                    break
         for m in self.mechs:
             if m is src or not m.alive or m.house:
                 continue
@@ -737,6 +756,10 @@ class Arena:
         else:
             m.grounded = nz - sup < 0.05
         m.pos = [x, y, nz]
+        if m.grounded and hyp(m.vel[0], m.vel[1]) > self.cfg["sound"]["step_speed"]:
+            if self.t - getattr(m, "step_t", -9) >= self.cfg["sound"]["step_every"]:
+                m.step_t = self.t
+                self.sound("boost" if boost else "step", m.pos, m)
         tr, pr = st["turn_rate"] * DT, st["pitch_rate"] * DT
         dy = wrap(m.cmd_aim[0] - m.aim[0])
         m.aim[0] = wrap(m.aim[0] + max(-tr, min(tr, dy)))
@@ -1176,8 +1199,39 @@ class HouseBrain:
         return a
 
 
+class StrongBrain:
+    """A hunter that runs a real bot's act() against us only (always told where we are), plus aim noise."""
+
+    def __init__(self, arena, me, us, mod, hello, noise, rng):
+        self.A, self.me, self.us, self.noise, self.rng = arena, me, us, noise, rng
+        h = dict(hello)
+        h["slot"], h["seed"] = me.id, rng.randrange(1 << 30)
+        import io
+        import contextlib
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.bot = mod.Bot(h)
+
+    def decide(self, squad):
+        A, me, us = self.A, self.me, self.us
+        if self.A.P["omniscient"] or A.t - squad.known_t < 10:
+            me.seen[us.id] = A.t  # shared squad knowledge
+        o = A.obs_for(me)
+        o["mechs"] = [m for m in o["mechs"] if m["id"] == us.id or m["kind"] == "npc"]
+        o["alive"] = 16
+        me.events, me.sounds = [], []
+        mf.draw.clear()
+        try:
+            a = self.bot.act(o) or {}
+        except Exception:
+            a = {}
+        if "aim" in a:
+            a["aim"] = [a["aim"][0] + self.rng.gauss(0, self.noise), a["aim"][1] + self.rng.gauss(0, self.noise)]
+        a.pop("pick", None)
+        return a
+
+
 # ---------------------------------------------------------------------------------------------- match
-def play_match(mod, world, nav, hello, seed, params, max_t=480.0):
+def play_match(mod, world, nav, hello, seed, params, max_t=480.0, strong_mod=None):
     rng = random.Random(seed)
     cfg = hello["config"]
     A = Arena(world, nav, cfg, rng, params)
@@ -1185,6 +1239,11 @@ def play_match(mod, world, nav, hello, seed, params, max_t=480.0):
     A.populate(our_slot)
     us = A.mechs[our_slot]
     squad = Squad(A, us, params, rng)
+    A.squad = squad
+    if strong_mod is not None:
+        for m in squad.members:
+            if m.level in params["strong_levels"]:
+                m.strong = StrongBrain(A, m, us, strong_mod, hello, params["strong_noise"][m.level], rng)
     h = dict(hello)
     h["slot"] = our_slot
     h["seed"] = seed
@@ -1218,7 +1277,9 @@ def play_match(mod, world, nav, hello, seed, params, max_t=480.0):
         squad.update()
         for m in squad.members:
             if m.alive:
-                m.action = m.brain.decide(squad)
+                sb = getattr(m, "strong", None)
+                knows = params["omniscient"] or A.t - squad.known_t < 10
+                m.action = sb.decide(squad) if (sb is not None and m.brain.hunter and knows) else m.brain.decide(squad)
         for m in A.mechs:
             if m.alive:
                 A.apply_one_shots(m)
@@ -1327,6 +1388,7 @@ def _init():
     _W["world"] = World(hello["map"]["dir"], hello["config"])
     _W["nav"] = NavGrid(_W["world"])
     _W["mods"] = {}
+    _W["canopy"] = PC.canopy_grid(_W["world"], json.load(open(os.path.join(hello["map"]["dir"], "v2", "world.json"))))
 
 
 def _mod(spec, sets):
@@ -1357,7 +1419,8 @@ def _job(args):
     import io
     import contextlib
     with contextlib.redirect_stderr(io.StringIO()):
-        r = play_match(_mod(spec, sets), _W["world"], _W["nav"], _W["hello"], seed, params)
+        strong = _mod(params["strong_bot"], {}) if params.get("strong_levels") else None
+        r = play_match(_mod(spec, sets), _W["world"], _W["nav"], _W["hello"], seed, params, strong_mod=strong)
     r["seed"] = seed
     return r
 

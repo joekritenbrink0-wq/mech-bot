@@ -10,6 +10,7 @@ params = json.loads(json.dumps(AR.PARAMS))
 if len(sys.argv) > 3:
     for k, v in json.loads(sys.argv[3]).items():
         params[k] = v
+params.setdefault("strong_levels", [])
 AR._init()
 W = AR._W
 mod = load_bot_module(spec)
@@ -20,6 +21,11 @@ our_slot = rng.randrange(16)
 A.populate(our_slot)
 us = A.mechs[our_slot]
 squad = Squad(A, us, params, rng)
+if params.get("strong_levels"):
+    smod = load_bot_module(params["strong_bot"])
+    for m in squad.members:
+        if m.level in params["strong_levels"]:
+            m.strong = AR.StrongBrain(A, m, us, smod, W["hello"], params["strong_noise"][m.level], rng)
 h = dict(W["hello"]); h["slot"] = our_slot; h["seed"] = seed
 bot = mod.Bot(h)
 A.zone = A.zone_now()
@@ -36,7 +42,8 @@ while A.t < 480 and us.alive:
     squad.update()
     for m in squad.members:
         if m.alive:
-            m.action = m.brain.decide(squad)
+            sb = getattr(m, "strong", None)
+            m.action = sb.decide(squad) if (sb is not None and m.brain.hunter) else m.brain.decide(squad)
     for m in A.mechs:
         if m.alive: A.apply_one_shots(m)
     for m in A.mechs:

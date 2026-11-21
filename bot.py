@@ -2,7 +2,10 @@
 path planning, cover-aware combat movement with laser peeking, disengage-and-regen, supply drops,
 and a practice-vs-FFA mode flag. See PLAN.md (one folder up)."""
 import gc
+import hashlib
 import math
+import os
+import struct
 import random
 import time
 import traceback
@@ -37,7 +40,15 @@ COVER_WHILE_CHARGING = False  # hide during our own laser charge when an enemy h
 ZONE_STRICT = True  # combat movement: hard penalty for leaving the zone, graded one for leaving the safe circle
 HOLD_FIRE_TO_REGEN = True  # while disengaging and not under fire, stop shooting so regen can start
 KITE_LIGHTNING = True  # keep lightning holders beyond their 45 m reach
+DISENGAGE_HP = 0.33  # start disengaging below this HP fraction (when USE_DISENGAGE)
+DISENGAGE_EXIT = 0.75  # stop disengaging above this HP fraction
+TWO_SPECIALS = False  # with a laser, swap the gun for lightning (and the reverse): laser + lightning loadout
 LOOT_IN_FIGHT = True  # weapons that upgrade our loadout and cubes pull combat movement toward them
+STEALTH = False  # when nobody has found us: sit in well-hidden spots, walk silently, don't start fights
+STEALTH_MAG = 0.38  # move command length while sneaking: 0.38 * 11.7 m/s = 4.4 m/s, under the 5 m/s step-sound speed
+STEALTH_ENGAGE_S = 6.0  # stay in fight mode this long after the last sign we were found
+FARM = False  # between fights, go after remembered drones (2 cubes) and crates (1 cube, 50% weapon) until 10 cubes
+FARM_RANGE = 220.0  # how far we'll walk for a farm target
 PATH_BUDGET_S = 0.008
 
 
@@ -102,6 +113,14 @@ class Bot:
         self.disengaging = False
         self.last_fight_yaw = None
         self.threats = []
+        self.conceal = None
+        self.hide = None
+        self.hide_t = -99.0
+        self.engaged_until = -99.0
+        try:
+            self.load_conceal(hello["map"]["dir"])
+        except Exception:
+            mf.log("conceal map not loaded: " + traceback.format_exc())
         self.t_start = time.perf_counter()
         gc.collect()
         gc.freeze()
@@ -146,6 +165,78 @@ class Bot:
                         self.side = sgn
                     return h, True
         return yaw, False
+
+    def load_conceal(self, map_dir):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conceal.bin")
+        with open(path, "rb") as f:
+            raw = f.read()
+        if raw[:4] != b"CNC1":
+            return
+        nx, ny, ox, oy, step = struct.unpack("<HHfff", raw[4:20])
+        sha = raw[20:40]
+        with open(os.path.join(map_dir, "v2", "world.json"), "rb") as f:
+            if hashlib.sha1(f.read()).digest() != sha:
+                mf.log("conceal map is for a different world.json: stealth spots off")
+                return
+        self.conceal = (nx, ny, ox, oy, step, raw[40:40 + nx * ny])
+
+    def conceal_at(self, x, y):
+        if self.conceal is None:
+            return 255
+        nx, ny, ox, oy, step, data = self.conceal
+        I, J = int((x - ox) / step + 0.5), int((y - oy) / step + 0.5)
+        if 0 <= I < nx and 0 <= J < ny:
+            return data[J * nx + I]
+        return 255
+
+    def pick_hide(self, me, scx, scy, srad):
+        """Best concealed walkable spot near us inside the circle we must stay in."""
+        if self.conceal is None:
+            return None
+        nx, ny, ox, oy, step, data = self.conceal
+        x, y, z = me["pos"]
+        R = 150.0
+        lim = max(8.0, srad * 0.72 - 6.0)
+        best, spot = -1e9, None
+        I0, I1 = max(0, int((x - R - ox) / step)), min(nx - 1, int((x + R - ox) / step) + 1)
+        J0, J1 = max(0, int((y - R - oy) / step)), min(ny - 1, int((y + R - oy) / step) + 1)
+        for J in range(J0, J1 + 1, 2 if R > 100 else 1):
+            cy = oy + J * step
+            row = J * nx
+            for I in range(I0, I1 + 1):
+                v = data[row + I]
+                if v == 255:
+                    continue
+                cx = ox + I * step
+                if hyp(cx - scx, cy - scy) > lim:
+                    continue
+                d = hyp(cx - x, cy - y)
+                if d > R:
+                    continue
+                sc = v - 0.3 * d
+                for th in self.threats:
+                    tm = th["m"]
+                    if hyp(tm["pos"][0] - cx, tm["pos"][1] - cy) < 70:
+                        sc -= 60
+                if sc > best:
+                    best, spot = sc, (cx, cy)
+        return spot
+
+    def found(self, obs, me, enemies):
+        """Signs that someone knows where we are."""
+        t = obs["t"]
+        x, y, z = me["pos"]
+        if t - self.dmg_t < STEALTH_ENGAGE_S:
+            return True
+        for m, d, vis in enemies:
+            if not vis:
+                continue
+            if d < 45.0:
+                return True
+            back = math.atan2(y - m["pos"][1], x - m["pos"][0])
+            if d < 200 and abs(wrap(m["aim"][0] - back)) < 0.35:
+                return True
+        return False
 
     def elapsed_ms(self):
         return (time.perf_counter() - self.t_start) * 1000.0
@@ -208,6 +299,8 @@ class Bot:
         if obs.get("offer"):
             act["pick"] = self.pick_upgrade(obs["offer"])
         self.remember_items(obs, me)
+        if FARM:
+            self.remember_farm(obs, me)
 
         slots = me["weapons"]
         held = {w["kind"]: i for i, w in enumerate(slots) if w}
@@ -246,13 +339,13 @@ class Bot:
         side_target = None
         if target is None:
             for m, d, vis in sorted(npcs, key=lambda e: e[1]):
-                if vis and d < 75 and (hp_frac > 0.5 or m["id"] in self._attackers(obs)):
+                if vis and d < (110 if FARM and "laser" in held else 75) and (hp_frac > 0.5 or m["id"] in self._attackers(obs)):
                     side_target = (m, d, vis)
                     break
             if side_target is None:
                 for c in sorted(obs["crates"], key=lambda c: hyp(c["pos"][0] - x, c["pos"][1] - y)):
                     d = hyp(c["pos"][0] - x, c["pos"][1] - y)
-                    if d > 70:
+                    if d > (110 if FARM and "laser" in held else 70):
                         break
                     cp = c["pos"]
                     if self.los((x, y, z + st.get("muzzle_height", 7)), (cp[0], cp[1], cp[2] + 1.2)):
@@ -260,7 +353,19 @@ class Bot:
                         break
 
         # ------------------------------------------------------------ movement
-        move_yaw, move_mag, boost, jump, label = self.choose_move(obs, me, held, target, side_target, hp_frac)
+        sneaking = False
+        if STEALTH:
+            if self.found(obs, me, enemies):
+                self.engaged_until = t + STEALTH_ENGAGE_S
+            sneaking = t >= self.engaged_until and obs["zone"]["next_radius"] > 30
+        if sneaking:
+            move_yaw, move_mag, boost, jump, label = self.sneak_move(obs, me, held, hp_frac)
+            if any(w and w["kind"] == "laser" and w.get("charge", 0) > 0 for w in slots):
+                pass  # an existing charge is held below
+            target_for_fire = None
+        else:
+            move_yaw, move_mag, boost, jump, label = self.choose_move(obs, me, held, target, side_target, hp_frac)
+            target_for_fire = target or side_target
 
         # obstacle steering + unstick
         if move_mag > 0.05:
@@ -294,7 +399,7 @@ class Bot:
             act["jump"] = True
 
         # ------------------------------------------------------------ aim and fire
-        aim, fire = self.choose_fire(obs, me, held, target or side_target, move_yaw, act)
+        aim, fire = self.choose_fire(obs, me, held, target_for_fire, move_yaw, act)
         act["aim"] = aim
         act["fire"] = fire
 
@@ -337,6 +442,48 @@ class Bot:
             if t - it["seen"] > ttl or (hyp(px - x, py - y) < 30 and self.los((x, y, eye), (px, py, pz + 0.5))):
                 del self.items[i]
 
+    def remember_farm(self, obs, me):
+        """Drones and crates we have seen (drones stay within 30 m of home; crates never move)."""
+        t = obs["t"]
+        x, y, z = me["pos"]
+        if not hasattr(self, "farm"):
+            self.farm = {}
+        now = set()
+        for m in obs["mechs"]:
+            if m["kind"] == "npc":
+                f = self.farm.get(m["id"])
+                self.farm[m["id"]] = {"kind": "npc", "pos": m["pos"], "seen": t, "hp": m.get("hp", 350)}
+                now.add(m["id"])
+        for c in obs["crates"]:
+            self.farm[c["id"]] = {"kind": "crate", "pos": c["pos"], "seen": t, "hp": c.get("hp", 300)}
+            now.add(c["id"])
+        eye = z + me["stats"].get("eye_height", 8.0)
+        for i in list(self.farm):
+            if i in now:
+                continue
+            f = self.farm[i]
+            px, py, pz = f["pos"]
+            ttl = 90.0 if f["kind"] == "npc" else 240.0
+            if t - f["seen"] > ttl or (hyp(px - x, py - y) < 40 and self.los((x, y, eye), (px, py, pz + 1.5))):
+                del self.farm[i]
+
+    def farm_goal(self, me, scx, scy, srad, hp_frac):
+        if me["cubes"] >= self.stat_cap or hp_frac < 0.45:
+            return None
+        x, y, z = me["pos"]
+        best, goal = 0.0, None
+        for f in getattr(self, "farm", {}).values():
+            px, py, pz = f["pos"]
+            if pz - z > 6 or hyp(px - scx, py - scy) > srad - 8:
+                continue
+            d = hyp(px - x, py - y)
+            if d > FARM_RANGE or d < 30:
+                continue
+            v = (2.0 if f["kind"] == "npc" else 1.3) * 60.0 / (d + 30.0)
+            if v > best:
+                best, goal = v, (px, py, "farm " + f["kind"])
+        return goal
+
     def _attackers(self, obs):
         return {e.get("by") for e in obs["events"] if e["type"] == "damaged"}
 
@@ -351,11 +498,11 @@ class Bot:
 
         # disengage hysteresis: get out of a losing fight, come back after regen
         if USE_DISENGAGE:
-            if not self.disengaging and hp_frac < 0.33 and self.threats:
+            if not self.disengaging and hp_frac < DISENGAGE_HP and self.threats:
                 th = self.threats[0]["m"]
                 if th.get("hp", 0) / max(1, th.get("max_hp", 1400)) > hp_frac + 0.1 or len(self.threats) >= 2:
                     self.disengaging = True
-            elif self.disengaging and (hp_frac > 0.75 or (not self.threats and t - self.dmg_t > 12)):
+            elif self.disengaging and (hp_frac > DISENGAGE_EXIT or (not self.threats and t - self.dmg_t > 12)):
                 self.disengaging = False
 
         # 1. outside the zone: run home
@@ -396,6 +543,12 @@ class Bot:
             d = hyp(gx - x, gy - y)
             return self.head_to(me, gx, gy, t), 1.0 if d > 6 else 0.5, False, False, why
 
+        # 5b. farm: walk to remembered drones and crates for cubes
+        if FARM and side_target is None and not self.disengaging:
+            g = self.farm_goal(me, scx, scy, srad, hp_frac)
+            if g is not None:
+                return self.head_to(me, g[0], g[1], t), 1.0, False, False, g[2]
+
         # 6. npc / crate: hold a shooting range
         if side_target is not None and not self.disengaging:
             m, d, vis = side_target
@@ -416,6 +569,31 @@ class Bot:
         if dn > want:
             return self.head_to(me, ncx, ncy, t), 1.0, False, False, "drift"
         return 0.0, 0.0, False, False, "hold"
+
+    def sneak_move(self, obs, me, held, hp_frac):
+        """Unfound: go to a well-hidden spot quietly; only nearby loot or the zone make us move faster."""
+        x, y, z = me["pos"]
+        t = obs["t"]
+        zn = obs["zone"]
+        (scx, scy), srad = self.zone_safe_radius(obs)
+        if not me["in_zone"]:
+            cx, cy = zn["center"]
+            return self.head_to(me, cx, cy, t), 1.0, me["energy"] > 20, False, "zone!"
+        dz = hyp(x - scx, y - scy)
+        if dz > srad - max(8.0, min(30.0, srad * 0.15)):
+            late = t >= zn["shrink_start"] - 8
+            return self.head_to(me, scx, scy, t), 1.0 if late else STEALTH_MAG * 2, late and me["energy"] > 40, False, "zone"
+        goal = self.loot_goal(obs, me, held, scx, scy, srad)
+        if goal is not None and hyp(goal[0] - x, goal[1] - y) < 60:
+            return self.head_to(me, goal[0], goal[1], t), STEALTH_MAG, False, False, "sneak " + goal[2]
+        if self.hide is None or t - self.hide_t > 10 or hyp(self.hide[0] - scx, self.hide[1] - scy) > srad * 0.8:
+            self.hide = self.pick_hide(me, scx, scy, srad) or (scx, scy)
+            self.hide_t = t
+        hx, hy = self.hide
+        d = hyp(hx - x, hy - y)
+        if d > 2.5:
+            return self.head_to(me, hx, hy, t), STEALTH_MAG, False, False, f"hide {self.conceal_at(hx, hy)}"
+        return 0.0, 0.0, False, False, f"hidden {self.conceal_at(x, y)}"
 
     def final_point(self, me, zn, t):
         """Stand on the next circle's center: in the last phase it stays inside the zone until the very end."""
@@ -576,6 +754,19 @@ class Bot:
             return to, 0.0, False, False, label
         return a, 1.0, boost, jump, label
 
+    def pickup_gain(self, k, me, held):
+        """How much better our loadout gets by taking a weapon of kind k (<= 0: not worth it)."""
+        if k == "gun" or k in held:
+            return 0.0
+        empty = any(w is None for w in me["weapons"])
+        if empty:
+            return WEAPON_VALUE[k]
+        specials = [x for x in held if x != "gun"]
+        if TWO_SPECIALS and "gun" in held and specials and {k, specials[0]} == {"laser", "lightning"}:
+            return 1.5  # replaces the gun
+        cur = min((WEAPON_VALUE[x] for x in specials), default=0.0)
+        return WEAPON_VALUE[k] - cur
+
     def fight_lures(self, me, held):
         """(x, y, value, radius) of nearby loot worth stepping toward mid-fight."""
         x, y, z = me["pos"]
@@ -592,7 +783,7 @@ class Bot:
                 if me["cubes"] < self.stat_cap and d < 45:
                     out.append((px, py, 0.6, 45.0))
             elif k != "gun" and k not in held:
-                gain = WEAPON_VALUE[k] - (0 if empty else cur)
+                gain = self.pickup_gain(k, me, held)
                 if gain > 0 and d < 70:
                     out.append((px, py, 1.2 * gain, 70.0))
         out.sort(key=lambda o: -o[2])
@@ -633,7 +824,7 @@ class Bot:
             px, py, pz = it["pos"]
             if pz - z > 3.5 or hyp(px - scx, py - scy) > srad - 5:
                 continue
-            gain = WEAPON_VALUE[k] - (0 if empty else cur)
+            gain = self.pickup_gain(k, me, held)
             if gain <= 0:
                 continue
             d = hyp(px - x, py - y)
@@ -824,6 +1015,14 @@ class Bot:
                 continue
             if empty:
                 act["take"] = p["id"]
+                return
+            if self.pickup_gain(k, me, held) <= 0:
+                continue
+            specials = [x for x in held if x != "gun"]
+            if TWO_SPECIALS and "gun" in held and specials and {k, specials[0]} == {"laser", "lightning"}:
+                act["take"] = p["id"]
+                act["drop"] = held["gun"]
+                act["fire"][held["gun"]] = False
                 return
             # swap out the weakest non-gun weapon if this one is better
             worst_i, worst_v = None, 1e9
