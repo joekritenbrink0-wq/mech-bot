@@ -3,7 +3,7 @@
 FROM python:3.13.14-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /bot
-COPY mechfight.py world.py bot.py ./
+COPY mechfight.py world.py nav.py bot.py ./
 # Compile now: the disk is read-only at match time.
 RUN python3 -m compileall -q /bot
 ENTRYPOINT ["python3", "-u", "/bot/bot.py"]

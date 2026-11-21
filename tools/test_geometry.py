@@ -98,3 +98,40 @@ for R, vis in ((120, True), (200, True), (120, False)):
 offer = {"id": 1, "expires": 15, "choices": [{"id": "sensors"}, {"id": "plating"}, {"id": "gun_rate"}]}
 assert b.pick_upgrade(offer) == 1
 print("all geometry checks passed")
+
+# 6. with the real map: supply drop, zone and final-point decisions
+hello2 = json.loads(gzip.open(os.path.join(KIT, "check", "stream.jsonl.gz"), "rt").readline())
+hello2["map"]["dir"] = os.path.join(KIT, "arena")
+b2 = bot.Bot(hello2)
+assert b2.nav is not None
+import mechfight as mf
+
+
+def label_of(o):
+    mf.draw.clear()
+    a = b2.act(o)
+    json.dumps(a)
+    return (mf.draw.take() or {}).get("label", ""), a
+
+
+o = obs([], [gun, None], t=100.0)
+o["self"]["pos"] = [-60.0, 0.0, 0.0]
+o["drops"] = [{"id": 20000, "pos": [-80.4, 12.9, 0.0], "radius": 8, "lands_in": 3.0, "capture_s": 4, "progress": 0, "holder": None}]
+lab, a = label_of(o)
+assert lab.startswith("drop"), lab
+o["self"]["pos"] = [-80.0, 12.0, 0.0]
+lab, a = label_of(o)
+assert lab.startswith("capture") and a["move"] == [0.0, 0.0], (lab, a["move"])
+print("supply drop ok")
+
+o = obs([], [gun, None], t=200.0)
+o["self"]["in_zone"] = False
+o["self"]["pos"] = [300.0, -250.0, 0.0]
+lab, a = label_of(o)
+assert lab.startswith("zone!") and a["boost"], lab
+o = obs([], [gun, None], t=380.0)
+o["zone"] = {"center": [0, 0], "radius": 25, "next_center": [-23.7, 2.2], "next_radius": 0, "shrink_start": 400, "shrink_end": 425, "dps": 260}
+o["self"]["pos"] = [-10.0, 0.0, 0.0]
+lab, a = label_of(o)
+assert lab.startswith("final"), lab
+print("zone and final point ok")
