@@ -47,7 +47,7 @@ LOOT_IN_FIGHT = True  # weapons that upgrade our loadout and cubes pull combat m
 STEALTH = False  # when nobody has found us: sit in well-hidden spots, walk silently, don't start fights
 STEALTH_MAG = 0.38  # move command length while sneaking: 0.38 * 11.7 m/s = 4.4 m/s, under the 5 m/s step-sound speed
 STEALTH_ENGAGE_S = 6.0  # stay in fight mode this long after the last sign we were found
-FARM = False  # between fights, go after remembered drones (2 cubes) and crates (1 cube, 50% weapon) until 10 cubes
+FARM = True  # between fights, go after remembered drones (2 cubes) and crates (1 cube, 50% weapon) until 10 cubes
 FARM_RANGE = 220.0  # how far we'll walk for a farm target
 PATH_BUDGET_S = 0.008
 
@@ -73,7 +73,7 @@ def weapon_dps(kind, d):
 
 
 class Bot:
-    name = "mech-bot v2"
+    name = "mech-bot v2-farm"
 
     def __init__(self, hello):
         cfg = hello["config"]
