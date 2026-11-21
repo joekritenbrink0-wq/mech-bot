@@ -11,6 +11,38 @@ A bot for the Builders Mech Royale track (mechfight/1). Python 3.13, standard li
 | `tools/run_stream.py` | Replays the kit's recorded stream in-process: timing and a sample of decisions |
 | `tools/test_geometry.py` | Checks aim lead, laser charge and release, mortar ballistics, upgrade picks, drop/zone/final-point decisions |
 | `tools/sim.py` | Approximate duel simulator on the real map against house-style hunters; compares bot versions |
+| `tools/arena.py` | Full practice-format match simulator (15-bot squad, zone, loot, crates, drones, cubes, upgrades, drops) and a 16-bot free-for-all mode; parallel |
+| `tools/trace_match.py` | Second-by-second timeline of one arena match |
+
+## Practice simulator (tools/arena.py)
+
+The squad model is a guess calibrated to the real practice scores we have:
+
+| Bot | Real practice | Sim (calibrated) |
+| --- | --- | --- |
+| starter (kit example) | 1.15 | about 0.8 |
+| v0 | 3.94 | about 4.2 to 4.6 |
+| v1 (commit 9f4e5fc) | 3.79 | about 4.4 |
+
+Calibrated settings: one hunter at the start plus one per two kills, everyone hunts after 300 s, non-hunters
+never start or return fights, house aim noise 3x the base profiles. Every new real score should be added to
+this table and the settings rechecked.
+
+```sh
+python -I tools/arena.py --bots "v1,v1+USE_DISENGAGE=False" --matches 160 --seed 6   # A/B with module switches
+python -I tools/arena.py --ffa "v1:8,starter:8" --matches 21                            # free-for-all
+python -I tools/trace_match.py v1 600001                                               # one match timeline
+```
+
+With 160 matches a score has about +-0.2 of noise; trust differences of 0.5 or more.
+
+## v2 changes (on top of v1), chosen with the practice simulator
+
+- Combat movement never leaves the zone (hard penalty) and stays inside the next circle (graded penalty).
+- Keeps lightning holders beyond 58 m and boosts away when one is close.
+- Weapons that upgrade the loadout and cubes pull combat movement toward them, so kills' drops get picked up.
+- Disengage switched off (scored lower in two sim A/B runs); hold-fire-to-regen kept for when it is on.
+- Sim (calibrated): v2 about 6.5 vs v0 about 4.6 and v1 (as submitted) about 4.4.
 
 ## v1 changes (on top of v0)
 

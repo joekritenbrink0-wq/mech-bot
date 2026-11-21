@@ -1,4 +1,4 @@
-"""mech-bot v1: v0 (aimed fire, laser charge/release, loot memory, zone/endgame, steering, unstick) plus
+"""mech-bot v2 (v1 + zone-strict combat movement, lightning kiting, looting mid-fight, disengage off): v0 (aimed fire, laser charge/release, loot memory, zone/endgame, steering, unstick) plus
 path planning, cover-aware combat movement with laser peeking, disengage-and-regen, supply drops,
 and a practice-vs-FFA mode flag. See PLAN.md (one folder up)."""
 import gc
@@ -13,6 +13,12 @@ from nav import NavGrid, Follower
 
 TAU = 2 * math.pi
 
+UPGRADE_OFFENSE = [
+    "laser_damage", "laser_charge", "plating", "gun_damage", "gun_rate", "armor", "lightning_efficiency", "nanites", "gyros",
+    "lightning_range", "sensors", "servos", "reactor", "capacitor", "jets", "gun_mag", "gun_velocity",
+    "mortar_reload", "mortar_velocity", "lightning_chain", "laser_pierce", "mortar_splash",
+]
+UPGRADE_SET = "defense"  # "defense" (UPGRADE_PRIORITY) or "offense" (UPGRADE_OFFENSE)
 UPGRADE_PRIORITY = [
     "plating", "armor", "nanites", "laser_damage", "laser_charge", "gyros", "lightning_efficiency",
     "gun_damage", "gun_rate", "lightning_range", "sensors", "servos", "reactor", "capacitor", "jets",
@@ -26,8 +32,12 @@ FIGHT_DIRS = [i * TAU / 12 for i in range(12)]
 USE_NAV = True
 USE_COVER = True
 USE_DROPS = True
-USE_DISENGAGE = True
+USE_DISENGAGE = False  # sim A/B (2 seed sets, 280 matches each side): off scored +0.2 and +0.5
 COVER_WHILE_CHARGING = False  # hide during our own laser charge when an enemy has a laser
+ZONE_STRICT = True  # combat movement: hard penalty for leaving the zone, graded one for leaving the safe circle
+HOLD_FIRE_TO_REGEN = True  # while disengaging and not under fire, stop shooting so regen can start
+KITE_LIGHTNING = True  # keep lightning holders beyond their 45 m reach
+LOOT_IN_FIGHT = True  # weapons that upgrade our loadout and cubes pull combat movement toward them
 PATH_BUDGET_S = 0.008
 
 
@@ -52,7 +62,7 @@ def weapon_dps(kind, d):
 
 
 class Bot:
-    name = "mech-bot v1"
+    name = "mech-bot v2"
 
     def __init__(self, hello):
         cfg = hello["config"]
@@ -166,7 +176,7 @@ class Bot:
 
     def pick_upgrade(self, offer):
         ids = [c["id"] for c in offer["choices"]]
-        for u in UPGRADE_PRIORITY:
+        for u in (UPGRADE_OFFENSE if UPGRADE_SET == "offense" else UPGRADE_PRIORITY):
             if u in ids:
                 return ids.index(u)
         return 0
@@ -461,8 +471,8 @@ class Bot:
             lo, hi = 40.0, 105.0
         if "lightning" in held and d < 50:
             lo, hi = 10.0, 30.0
-        if "lightning" in m.get("weapons", []) and "lightning" not in held:
-            lo = max(lo, 55.0)
+        if "lightning" in m.get("weapons", []) and ("lightning" not in held or KITE_LIGHTNING):
+            lo, hi = max(lo, 60.0), max(hi, 100.0)
 
         if t >= self.strafe_until:
             self.strafe = -self.strafe
@@ -484,6 +494,8 @@ class Bot:
         if not USE_COVER:
             return self._v0_fight(me, m, d, vis, lo, hi, hp_frac, dodge, scx, scy, srad, energy, t)
 
+        (zcx, zcy), zr = obs["zone"]["center"], obs["zone"]["radius"]
+        lures = self.fight_lures(me, held) if LOOT_IN_FIGHT else []
         speed = st.get("walk_speed", 11.7) * (0.5 if charge > 0 else 1.0)
         horizon = 0.7
         mz = st.get("muzzle_height", 7.0)
@@ -518,10 +530,28 @@ class Bot:
             s -= (3.0 if want_cover else 0.8) * exp / 150.0
             s -= 8.0 * exp_charger
             if self.disengaging:
-                s += 0.02 * min(dp, 300.0)
+                s += 0.01 * min(dp, 200.0)
             else:
                 s -= 0.03 * max(0.0, lo - dp) + 0.02 * max(0.0, dp - hi)
-            if hyp(px - scx, py - scy) > srad * 0.92 and srad > 5:
+            for lx, ly, val, rad in lures:
+                dl = hyp(lx - px, ly - py)
+                if dl < rad:
+                    s += val * (1.0 - dl / rad)
+            if KITE_LIGHTNING:
+                for th in self.threats:
+                    tm = th["m"]
+                    if "lightning" in tm.get("weapons", []):
+                        dl = hyp(tm["pos"][0] - px, tm["pos"][1] - py)
+                        if dl < 58.0:
+                            s -= 0.25 * (58.0 - dl)
+            if ZONE_STRICT:
+                out_cur = hyp(px - zcx, py - zcy) - (zr - 4.0)
+                if out_cur > 0:
+                    s -= 25.0 + 1.0 * out_cur
+                out_safe = hyp(px - scx, py - scy) - srad * 0.9
+                if out_safe > 0 and srad > 5:
+                    s -= 1.0 + 0.1 * out_safe
+            elif hyp(px - scx, py - scy) > srad * 0.92 and srad > 5:
                 s -= 3.0
             if a is None:
                 if exp > 0 and not peek:
@@ -538,12 +568,35 @@ class Bot:
             return to + math.pi / 2 * self.strafe, 1.0, False, True, "boxed"
         _, a, exp, exp_charger = best
         self.last_fight_yaw = a
-        boost = energy > 30 and (dodge or self.disengaging or (want_cover and exp > 0))
+        zap_near = KITE_LIGHTNING and any("lightning" in th["m"].get("weapons", []) and th["d"] < 62 for th in self.threats)
+        boost = energy > 30 and (dodge or self.disengaging or (want_cover and exp > 0) or zap_near)
         jump = dodge and exp_charger > 0 and self.rng.random() < 0.3
         label = "evade" if self.disengaging else ("peek" if peek else ("cover" if want_cover else ("fight" if vis else "hunt")))
         if a is None:
             return to, 0.0, False, False, label
         return a, 1.0, boost, jump, label
+
+    def fight_lures(self, me, held):
+        """(x, y, value, radius) of nearby loot worth stepping toward mid-fight."""
+        x, y, z = me["pos"]
+        out = []
+        cur = min((WEAPON_VALUE[k] for k in held if k != "gun"), default=0.0)
+        empty = any(w is None for w in me["weapons"])
+        for it in self.items.values():
+            px, py, pz = it["pos"]
+            if pz - z > 3.5:
+                continue
+            d = hyp(px - x, py - y)
+            k = it["kind"]
+            if k == "cube":
+                if me["cubes"] < self.stat_cap and d < 45:
+                    out.append((px, py, 0.6, 45.0))
+            elif k != "gun" and k not in held:
+                gain = WEAPON_VALUE[k] - (0 if empty else cur)
+                if gain > 0 and d < 70:
+                    out.append((px, py, 1.2 * gain, 70.0))
+        out.sort(key=lambda o: -o[2])
+        return out[:4]
 
     def _v0_fight(self, me, m, d, vis, lo, hi, hp_frac, dodge, scx, scy, srad, energy, t):
         x, y, z = me["pos"]
@@ -719,6 +772,17 @@ class Bot:
                     aim = sol
                     if err(sol) < 0.02 and M["cooldown"] <= 0:
                         fire[mor_i] = True
+
+        # Regen needs 5 s without dealing damage too: while evading and not being shot, stop shooting
+        # unless the shot would finish the target.
+        if HOLD_FIRE_TO_REGEN and self.disengaging and kind == "mech" and t - self.dmg_t > 1.5:
+            if m.get("hp", 1e9) / max(1.0, m.get("max_hp", 1400)) > 0.25:
+                for i, w in enumerate(slots):
+                    if w is None:
+                        continue
+                    if w["kind"] == "laser" and w.get("charge", 0) > 0:
+                        continue  # can't cancel a charge; let it play out
+                    fire[i] = False
 
         pmin = self.cfg["mech"].get("min_pitch", -0.7)
         pmax = self.cfg["mech"].get("max_pitch", 1.3)
