@@ -49,7 +49,7 @@ STEALTH_MAG = 0.38  # move command length while sneaking: 0.38 * 11.7 m/s = 4.4 
 STEALTH_ENGAGE_S = 6.0  # stay in fight mode this long after the last sign we were found
 FARM = True  # between fights, go after remembered drones (2 cubes) and crates (1 cube, 50% weapon) until 10 cubes
 FARM_RANGE = 220.0  # how far we'll walk for a farm target
-SEED_SALT = 1  # mixed into our RNG seed: same strength, different match paths (variant submissions)
+SEED_SALT = 2  # mixed into our RNG seed: same strength, different match paths (variant submissions)
 PATH_BUDGET_S = 0.008
 
 
@@ -74,7 +74,7 @@ def weapon_dps(kind, d):
 
 
 class Bot:
-    name = "mech-bot v2-farm s1"
+    name = "mech-bot v2-farm s2"
 
     def __init__(self, hello):
         cfg = hello["config"]
