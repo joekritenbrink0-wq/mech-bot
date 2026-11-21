@@ -118,11 +118,15 @@ o = obs([], [gun, None], t=100.0)
 o["self"]["pos"] = [-60.0, 0.0, 0.0]
 o["drops"] = [{"id": 20000, "pos": [-80.4, 12.9, 0.0], "radius": 8, "lands_in": 3.0, "capture_s": 4, "progress": 0, "holder": None}]
 lab, a = label_of(o)
-assert lab.startswith("drop"), lab
-o["self"]["pos"] = [-80.0, 12.0, 0.0]
-lab, a = label_of(o)
-assert lab.startswith("capture") and a["move"] == [0.0, 0.0], (lab, a["move"])
-print("supply drop ok")
+if bot.STEALTH:
+    assert lab.startswith("hide") or lab.startswith("hidden"), lab  # stealth skips drops on purpose
+    print("stealth hides instead of taking the drop: ok")
+else:
+    assert lab.startswith("drop"), lab
+    o["self"]["pos"] = [-80.0, 12.0, 0.0]
+    lab, a = label_of(o)
+    assert lab.startswith("capture") and a["move"] == [0.0, 0.0], (lab, a["move"])
+    print("supply drop ok")
 
 o = obs([], [gun, None], t=200.0)
 o["self"]["in_zone"] = False
